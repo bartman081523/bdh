@@ -66,7 +66,8 @@ def train(args):
         k_wta=max(1, args.n // 8),
         branches=2, branch_nl="softplus",
         mod_gamma_max=0.8, spike_rate=0.01,
-        ln_before_Dy=True, use_relu_lowrank=True
+        ln_before_Dy=True, use_relu_lowrank=True,
+        x_decay=0.97
     ).to(device)
 
     lm = BDHLanguageModel(model).to(device)
