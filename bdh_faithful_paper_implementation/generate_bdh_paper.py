@@ -1,14 +1,14 @@
 # generate_bdh_paper.py
-# Text generation script for the trained BDH-GPU model.
+# Textgenerierungs-Skript mit korrekter Logik zum Laden und Aufwärmen des Modells.
 
 import argparse
 import torch
 import torch.nn.functional as F
 from bdh_paper import BDH_GPU
-from train_bdh_paper import BDHLanguageModel # Reuse the wrapper and vocab loader
+from train_with_debug import BDHLanguageModel # Importiere aus dem neuen Trainingsskript
 
 def load_vocab_from_file(path: str):
-    """Loads only the vocabulary mappings from a text file."""
+    """Lädt nur die Vokabular-Mappings aus einer Textdatei."""
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     vocab = sorted(list(set(text)))
@@ -24,58 +24,56 @@ def generate(args):
     stoi, itos = load_vocab_from_file(args.file)
     vocab_size = len(stoi)
 
-    # --- Model Initialization and Loading ---
     core_model = BDH_GPU(n=args.n, d=args.d, V=vocab_size)
     model = BDHLanguageModel(core_model).to(device)
 
-    print("Loading trained model from bdh_paper_model.pt...")
-    model.load_state_dict(torch.load("bdh_paper_model.pt", map_location=device))
+    print("Loading trained model parameters from bdh_paper_model.pt...")
+    model.load_state_dict(torch.load("bdh_paper_model.pt", map_location=device), strict=False)
     model.eval()
 
-    # --- Generation Process ---
-    prompt_ids = torch.tensor([stoi.get(c, 0) for c in args.prompt], dtype=torch.long, device=device).unsqueeze(0)
+    # --- Generierungsprozess ---
+    prompt_ids = [stoi.get(c, 0) for c in args.prompt]
 
-    # Warm up the model's state with the prompt
+    # 1. Zustand mit dem Prompt initialisieren (aufwärmen) - SAUBERE VERSION
     print("Warming up model state with prompt...")
-    # We run the full forward pass on the prompt to set the state correctly.
-    # The output logits are discarded.
-    _ = model(prompt_ids)
+    model.core.reset_state(1, device) # Starte mit einem leeren Zustand für die Generierung (batch_size=1)
 
-    # The last token of the prompt is the first input for generation
-    current_token_idx = prompt_ids[:, -1]
+    # Wir verarbeiten den Prompt Token für Token, um den Zustand `rho` aufzubauen.
+    # Der letzte Token wird nicht verarbeitet, da er der erste Input für die Generierungsschleife ist.
+    for token_id in prompt_ids[:-1]:
+        idx_tensor = torch.tensor([[token_id]], device=device)
+        _ = model.core.step(idx_tensor.squeeze(0))
+
+    # Der letzte Token des Prompts ist der erste Input für die eigentliche Generierung
+    current_token_idx = torch.tensor([[prompt_ids[-1]]], device=device)
 
     generated_text = args.prompt
     print(f"--- Starting generation from prompt: '{args.prompt}' ---")
 
     for _ in range(args.length):
-        # Get the output vector `v` for the current token
-        # model.core.v is the state from the last `step` call inside `forward`
-        v_out = model.core.v
+        # Führe einen einzigen Schritt aus, um den nächsten Token vorherzusagen
+        v_out = model.core.step(current_token_idx.squeeze(0))
 
-        # Get logits from the head
+        # Prüfe auf Instabilität
+        if torch.isnan(v_out).any():
+            print("\n!!! NaN detected in model state. Stopping generation. !!!")
+            break
+
         logits = model.head(v_out)
 
-        # Apply temperature and get probabilities
         logits = logits / args.temperature
         probs = F.softmax(logits, dim=-1)
 
-        # Sample the next token
-        next_token_idx = torch.multinomial(probs, num_samples=1).squeeze(0)
+        next_token_idx = torch.multinomial(probs, num_samples=1)
 
-        # Append the character to our sequence
         next_char = itos.get(next_token_idx.item(), '?')
         generated_text += next_char
 
-        # Update the model's state with the newly generated token
-        # We call `step` directly to advance the recurrence by one token
-        _ = model.core.step(next_token_idx)
-
-        # The new token becomes the current token for the next iteration
+        # Der generierte Token wird zum Input für den nächsten Schritt
         current_token_idx = next_token_idx
 
     print(generated_text)
     print("\n--- Generation complete ---")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text with a trained BDH-GPU model.")
