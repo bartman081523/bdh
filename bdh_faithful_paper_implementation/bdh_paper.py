@@ -94,11 +94,12 @@ class BDH_GPU(nn.Module):
 
         # --- Attention Readout (Linear Attention) ---
         # rho is (B, d, n), x_t is (B, n) -> a_star is (B, d)
-        a_star = torch.einsum('b...dn,bn->bd', self.rho, x_t)
+        a_star = torch.einsum('bdn,bn->bd', self.rho, x_t)
 
         # --- Update y-state (Equation 8, y_t line) ---
         # This is the "feed-forward" part of the step.
-        y_core = self.Dy @ layernorm_row(a_star) # (B, n)
+        # ---- FIX WAS APPLIED HERE ----
+        y_core = layernorm_row(a_star) @ self.Dy.T # (B, n)
         y_t = relu(y_core) * relu(x_t) # Gated by positive part of x
 
         # --- Compute Output Vector (v*) ---
