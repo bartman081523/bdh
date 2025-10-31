@@ -1,5 +1,5 @@
-# bdh_paper.py (VERSION 19 - Final & Lauffähig)
-# Stellt die bewährte, funktionierende RoPE-Logik aus V15 wieder her.
+# bdh_paper.py (VERSION 15 - Final & Lauffähig)
+# Enthält die korrigierte, stabile Implementierung von RoPE und der BDH-Kernlogik.
 
 import torch
 import torch.nn as nn
@@ -7,8 +7,6 @@ import torch.nn.functional as F
 
 # Globale Variable, die durch den Parser in train.py gesteuert wird
 DIM_DEBUG = False
-DEBUG_COUNTER = 0
-DEBUG_LIMIT = 5
 
 def rotate_half(x):
     """ Rotiert die Hälften des Tensors. [x1, x2] -> [-x2, x1] """
@@ -17,7 +15,7 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(x, cos, sin):
     """ Wendet die Rotation an, mit korrektem Broadcasting. """
-    # cos/sin haben die Form (seq_len, dim)
+    # cos/sin haben die Form (seq_len, dim) oder (1, dim)
     # x hat die Form (batch, seq_len, dim)
     # Unsqueeze fügt eine Batch-Dimension für Broadcasting hinzu
     return (x * cos.unsqueeze(0)) + (rotate_half(x) * sin.unsqueeze(0))
@@ -31,38 +29,29 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
+        # Pre-compute the sin and cos waves
         self.max_seq_len = max_seq_len
-        t = torch.arange(self.max_seq_len)
+        t = torch.arange(self.max_seq_len, device=self.inv_freq.device)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos())
         self.register_buffer("sin_cached", emb.sin())
 
     def forward(self, x: torch.Tensor, seq_len: int, offset: int = 0):
-        global DEBUG_COUNTER
         if seq_len + offset > self.max_seq_len:
-            # Erweitere den Cache dynamisch, falls nötig
-            self.max_seq_len = seq_len + offset
-            t = torch.arange(self.max_seq_len, device=x.device)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.cos_cached = emb.cos()
-            self.sin_cached = emb.sin()
+            raise ValueError(f"Sequence length {seq_len + offset} exceeds max_seq_len {self.max_seq_len}")
 
-        cos = self.cos_cached[offset : offset + seq_len].to(x.device)
-        sin = self.sin_cached[offset : offset + seq_len].to(x.device)
+        # Hole den relevanten Teil aus dem Cache
+        cos = self.cos_cached[offset : offset + seq_len, :]
+        sin = self.sin_cached[offset : offset + seq_len, :]
 
-        if DIM_DEBUG and DEBUG_COUNTER < DEBUG_LIMIT:
+        if DIM_DEBUG:
             print("\n--- Inside RotaryEmbedding ---")
             print(f"  Input x shape: {x.shape}")
             print(f"  cos/sin shape: {cos.shape}")
-            DEBUG_COUNTER += 1
-            if DEBUG_COUNTER == DEBUG_LIMIT:
-                print("  (Debug limit reached, suppressing further dimension logs)")
             print("--- Exiting RotaryEmbedding ---")
 
         return apply_rotary_pos_emb(x, cos, sin)
-
 
 class BDH_GPU(nn.Module):
     def __init__(self, n: int, d: int, V: int, u_decay: float = 0.97, x_decay: float = 0.97):
@@ -84,7 +73,7 @@ class BDH_GPU(nn.Module):
         self.x_state = torch.zeros(batch_size, self.n, device=device)
         self.rho_state = torch.zeros(batch_size, self.d, self.n, device=device)
 
-    def step(self, rotated_v_prev: torch.Tensor, x_state_in: torch.Tensor, rho_state_in: torch.Tensor):
+    def step(self, rotated_v_prev: torch.Tensor, x_state_in, rho_state_in):
         x_update = F.relu(rotated_v_prev @ self.Dx.T)
         x_t = self.x_decay * x_state_in + x_update
         x_t = F.normalize(x_t, p=1, dim=-1)
@@ -101,10 +90,10 @@ class BDH_GPU(nn.Module):
 
         return v_star, x_t, rho_t
 
-    def forward(self, embeddings: torch.Tensor, x_state_in=None, rho_state_in=None):
+    def forward(self, embeddings: torch.Tensor, x_state_in=None, rho_state_in=None) -> torch.Tensor:
         B, T, D = embeddings.shape
-        x_state = self.x_state.repeat(B, 1) if x_state_in is None else x_state_in
-        rho_state = self.rho_state.repeat(B, 1, 1) if rho_state_in is None else rho_state_in
+        x_state = self.x_state if x_state_in is None else x_state_in
+        rho_state = self.rho_state if rho_state_in is None else rho_state_in
 
         x_state, rho_state = x_state.detach(), rho_state.detach()
 
@@ -113,4 +102,7 @@ class BDH_GPU(nn.Module):
             v_out, x_state, rho_state = self.step(embeddings[:, t, :], x_state, rho_state)
             outputs.append(v_out.unsqueeze(1))
 
-        return torch.cat(outputs, dim=1), x_state, rho_state
+        self.x_state = x_state
+        self.rho_state = rho_state
+
+        return torch.cat(outputs, dim=1)

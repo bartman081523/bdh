@@ -1,5 +1,5 @@
-# train.py (VERSION 19 - Final & Lauffähig)
-# Stellt die bewährte, funktionierende Logik aus V15 wieder her.
+# train.py (VERSION 15 - Final & Lauffähig)
+# Nutzt die korrekte RoPE Implementierung und eine saubere Architektur.
 
 import argparse
 import torch
@@ -23,27 +23,26 @@ def load_text_and_vocab(path: str):
 def get_batch(data, block_size, batch_size, device, is_sequential=False, step=0):
     if is_sequential:
         total_len = len(data)
-        if total_len <= block_size + 1: return None, None
-        num_sequences_per_chunk = (total_len - 1) // batch_size
-        num_batches_per_chunk = num_sequences_per_chunk // block_size
-        if num_batches_per_chunk == 0: return None, None
+        if total_len <= block_size: return None, None
+        num_sequences_per_batch = (total_len - 1) // block_size // batch_size
+        if num_sequences_per_batch == 0: return None, None
         start_index = step * block_size
-        if start_index >= num_batches_per_chunk * block_size: return None, None
-        ix_starts = [start_index + i * num_sequences_per_chunk for i in range(batch_size)]
+        if start_index >= num_sequences_per_batch * block_size: return None, None
+        ix_starts = [start_index + i * (num_sequences_per_batch * block_size) for i in range(batch_size)]
         if any(i + block_size + 1 > len(data) for i in ix_starts): return None, None
         x = torch.stack([data[i:i+block_size] for i in ix_starts])
         y = torch.stack([data[i+1:i+1+block_size] for i in ix_starts])
     else:
-        if len(data) <= block_size + 1: return None, None
+        if len(data) <= block_size: return None, None
         ix = torch.randint(len(data) - block_size - 1, (batch_size,))
         x = torch.stack([data[i:i+block_size] for i in ix])
         y = torch.stack([data[i+1:i+1+block_size] for i in ix])
     return x.to(device), y.to(device)
 
 @torch.no_grad()
-def debug_model_state(model, epoch, x_s, rho_s):
+def debug_model_state(model, epoch):
     print("\n" + "="*50 + f"\nDEBUGGING MODEL STATE AFTER EPOCH {epoch}\n" + "="*50)
-    tensors = {"PARAM_E": model.core.E, "PARAM_Dx": model.core.Dx, "PARAM_Dy": model.core.Dy,"PARAM_Head": model.head.weight, "STATE_rho": rho_s, "STATE_x": x_s}
+    tensors = {"PARAM_E": model.core.E, "PARAM_Dx": model.core.Dx, "PARAM_Dy": model.core.Dy,"PARAM_Head": model.head.weight, "STATE_rho": model.core.rho_state, "STATE_x": model.core.x_state}
     for name, t in tensors.items():
         if t is None: continue
         if torch.isnan(t).any() or torch.isinf(t).any(): print(f"!!! WARNING: {name} contains NaN/Inf!")
@@ -58,12 +57,12 @@ class BDHLanguageModel(nn.Module):
         self.head = nn.Linear(core.d, core.V, bias=False)
         self.rope = RotaryEmbedding(core.d)
 
-    def forward(self, idx: torch.Tensor, x_state=None, rho_state=None, offset: int=0):
+    def forward(self, idx: torch.Tensor, x_state=None, rho_state=None):
         seq_len = idx.shape[1]
         token_embeddings = self.core.token_emb(idx)
-        rotated_embeddings = self.rope(token_embeddings, seq_len=seq_len, offset=offset)
-        v_out, final_x, final_rho = self.core(rotated_embeddings, x_state, rho_state)
-        return self.head(v_out), final_x, final_rho
+        rotated_embeddings = self.rope(token_embeddings, seq_len=seq_len)
+        v_out = self.core(rotated_embeddings, x_state, rho_state)
+        return self.head(v_out), self.core.x_state, self.core.rho_state
 
 @torch.no_grad()
 def evaluate_robust_memorization(model: BDHLanguageModel, full_text: str, stoi: dict, itos: dict, device: torch.device):
@@ -91,14 +90,13 @@ def evaluate_robust_memorization(model: BDHLanguageModel, full_text: str, stoi: 
 
         prompt_ids = torch.tensor([[stoi.get(c, 0) for c in prompt]], dtype=torch.long, device=device)
 
-        x_state = torch.zeros(1, model.core.n, device=device)
-        rho_state = torch.zeros(1, model.core.d, model.core.n, device=device)
+        model.core.reset_state(1, device)
+        x_state, rho_state = model.core.x_state, model.core.rho_state
 
-        if prompt_len > 0:
-            _, x_state, rho_state = model(prompt_ids, x_state, rho_state)
-            current_token_idx = prompt_ids[:, -1]
-        else:
-            current_token_idx = torch.tensor([[stoi.get('\n', 0)]], device=device)
+        if prompt_ids.shape[1] > 1:
+            _, x_state, rho_state = model(prompt_ids[:, :-1], x_state, rho_state)
+
+        current_token_idx = prompt_ids[:, -1]
 
         probe_correct = 0
         for t, expected_char in enumerate(ground_truth):

@@ -1,11 +1,10 @@
-# generate.py (VERSION 18 - Final & Lauffähig)
-# Angepasst an die finale, korrekte Architektur.
+# generate.py (VERSION 13 - Final & Korrekt)
+# Nutzt die neue, saubere step-Funktion.
 
 import argparse
 import torch
 import torch.nn.functional as F
-from train import BDHLanguageModel # Hauptmodell-Klasse ist jetzt in train.py
-from bdh_paper import BDH_GPU     # Kern-Klasse
+from train import BDHLanguageModel, BDH_GPU, RotaryEmbedding, apply_rotary_pos_emb
 
 @torch.no_grad()
 def generate(args):
@@ -44,9 +43,10 @@ def generate(args):
         position = prompt_len + i
 
         token_emb = model.core.token_emb(current_token_idx)
-        rotated_emb = model.rope(token_emb.unsqueeze(1), seq_len=1, offset=position)
+        cos, sin = model.rope(token_emb, seq_len=1, offset=position)
+        rotated_emb = apply_rotary_pos_emb(token_emb.unsqueeze(1), cos, sin).squeeze(1)
 
-        v_out, x_state, rho_state = model.core.step(rotated_emb.squeeze(1), x_state, rho_state)
+        v_out, x_state, rho_state = model.core.step(rotated_emb, x_state, rho_state)
         logits = model.head(v_out)
 
         probs = F.softmax(logits / args.temperature, dim=-1)
@@ -56,7 +56,7 @@ def generate(args):
         generated_text += next_char
         print(next_char, end='', flush=True)
 
-        current_token_idx = next_token_idx
+        current_token_idx = next_token_idx.squeeze(0)
 
     print("\n\n--- Generation complete ---")
 
