@@ -1,0 +1,834 @@
+Repository Documentation
+This document provides a comprehensive overview of the repository's structure and contents.
+The first section, titled 'Directory/File Tree', displays the repository's hierarchy in a tree format.
+In this section, directories and files are listed using tree branches to indicate their structure and relationships.
+Following the tree representation, the 'File Content' section details the contents of each file in the repository.
+Each file's content is introduced with a '[File Begins]' marker followed by the file's relative path,
+and the content is displayed verbatim. The end of each file's content is marked with a '[File Ends]' marker.
+This format ensures a clear and orderly presentation of both the structure and the detailed contents of the repository.
+
+Directory/File Tree Begins -->
+
+/
+├── bartman
+│   ├── bdh_paper.py
+│   ├── generate.py
+│   └── train.py
+└── takzen
+    ├── bdh.py
+    └── train.py
+
+<-- Directory/File Tree Ends
+
+File Content Begin -->
+[File Begins] bartman/bdh_paper.py
+# bdh_paper.py (VERSION 15 - Final & Lauffähig)
+# Enthält die korrigierte, stabile Implementierung von RoPE und der BDH-Kernlogik.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Globale Variable, die durch den Parser in train.py gesteuert wird
+DIM_DEBUG = False
+
+def rotate_half(x):
+    """ Rotiert die Hälften des Tensors. [x1, x2] -> [-x2, x1] """
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(x, cos, sin):
+    """ Wendet die Rotation an, mit korrektem Broadcasting. """
+    # cos/sin haben die Form (seq_len, dim) oder (1, dim)
+    # x hat die Form (batch, seq_len, dim)
+    # Unsqueeze fügt eine Batch-Dimension für Broadcasting hinzu
+    return (x * cos.unsqueeze(0)) + (rotate_half(x) * sin.unsqueeze(0))
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=4096):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Dimension muss gerade sein, ist aber {dim}")
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # Pre-compute the sin and cos waves
+        self.max_seq_len = max_seq_len
+        t = torch.arange(self.max_seq_len, device=self.inv_freq.device)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos())
+        self.register_buffer("sin_cached", emb.sin())
+
+    def forward(self, x: torch.Tensor, seq_len: int, offset: int = 0):
+        if seq_len + offset > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len + offset} exceeds max_seq_len {self.max_seq_len}")
+
+        # Hole den relevanten Teil aus dem Cache
+        cos = self.cos_cached[offset : offset + seq_len, :]
+        sin = self.sin_cached[offset : offset + seq_len, :]
+
+        if DIM_DEBUG:
+            print("\n--- Inside RotaryEmbedding ---")
+            print(f"  Input x shape: {x.shape}")
+            print(f"  cos/sin shape: {cos.shape}")
+            print("--- Exiting RotaryEmbedding ---")
+
+        return apply_rotary_pos_emb(x, cos, sin)
+
+class BDH_GPU(nn.Module):
+    def __init__(self, n: int, d: int, V: int, u_decay: float = 0.97, x_decay: float = 0.97):
+        super().__init__()
+        self.n, self.d, self.V = n, d, V
+        self.u_decay, self.x_decay = u_decay, x_decay
+
+        self.token_emb = nn.Embedding(V, d)
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=1.0 / (d**0.5))
+
+        self.E = nn.Parameter(torch.randn(d, n) / (n**0.5))
+        self.Dx = nn.Parameter(torch.randn(n, d) / (d**0.5))
+        self.Dy = nn.Parameter(torch.randn(n, d) / (d**0.5))
+
+        self.register_buffer("x_state", torch.zeros(1, n))
+        self.register_buffer("rho_state", torch.zeros(1, d, n))
+
+    def reset_state(self, batch_size: int, device: torch.device):
+        self.x_state = torch.zeros(batch_size, self.n, device=device)
+        self.rho_state = torch.zeros(batch_size, self.d, self.n, device=device)
+
+    def step(self, rotated_v_prev: torch.Tensor, x_state_in, rho_state_in):
+        x_update = F.relu(rotated_v_prev @ self.Dx.T)
+        x_t = self.x_decay * x_state_in + x_update
+        x_t = F.normalize(x_t, p=1, dim=-1)
+
+        a_star = torch.einsum('bdn,bn->bd', rho_state_in, x_t)
+        y_core = F.layer_norm(a_star, [self.d]) @ self.Dy.T
+        y_t = F.relu(y_core) * F.relu(x_t)
+
+        v_star = F.layer_norm(y_t @ self.E.T, [self.d])
+
+        v_prev_normed = F.layer_norm(rotated_v_prev, [self.d])
+        increment = torch.einsum('bd,bn->bdn', v_prev_normed, x_t)
+        rho_t = self.u_decay * rho_state_in + increment
+
+        return v_star, x_t, rho_t
+
+    def forward(self, embeddings: torch.Tensor, x_state_in=None, rho_state_in=None) -> torch.Tensor:
+        B, T, D = embeddings.shape
+        x_state = self.x_state if x_state_in is None else x_state_in
+        rho_state = self.rho_state if rho_state_in is None else rho_state_in
+
+        x_state, rho_state = x_state.detach(), rho_state.detach()
+
+        outputs = []
+        for t in range(T):
+            v_out, x_state, rho_state = self.step(embeddings[:, t, :], x_state, rho_state)
+            outputs.append(v_out.unsqueeze(1))
+
+        self.x_state = x_state
+        self.rho_state = rho_state
+
+        return torch.cat(outputs, dim=1)
+
+[File Ends] bartman/bdh_paper.py
+
+[File Begins] bartman/generate.py
+# generate.py (VERSION 13 - Final & Korrekt)
+# Nutzt die neue, saubere step-Funktion.
+
+import argparse
+import torch
+import torch.nn.functional as F
+from train import BDHLanguageModel, BDH_GPU, RotaryEmbedding, apply_rotary_pos_emb
+
+@torch.no_grad()
+def generate(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    print("Loading checkpoint from bdh_model_checkpoint.pt...")
+    checkpoint = torch.load("bdh_model_checkpoint.pt", map_location=device)
+
+    stoi, itos, config = checkpoint['stoi'], checkpoint['itos'], checkpoint['config']
+
+    core_model = BDH_GPU(n=config['n'], d=config['d'], V=config['V'],
+                         u_decay=config['u_decay'], x_decay=config['x_decay'])
+    model = BDHLanguageModel(core_model).to(device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    print("Model and vocabulary loaded successfully.")
+
+    prompt_ids = torch.tensor([[stoi.get(c, 0) for c in args.prompt]], dtype=torch.long, device=device)
+    prompt_len = prompt_ids.shape[1]
+
+    print("Warming up model state with prompt...")
+    x_state = torch.zeros(1, model.core.n, device=device)
+    rho_state = torch.zeros(1, model.core.d, model.core.n, device=device)
+    if prompt_len > 1:
+        _, x_state, rho_state = model(prompt_ids[:, :-1], x_state, rho_state)
+
+    current_token_idx = prompt_ids[:, -1]
+
+    generated_text = args.prompt
+    print(f"--- Starting generation from prompt: '{args.prompt}' ---")
+    print(generated_text, end='', flush=True)
+
+    for i in range(args.length):
+        position = prompt_len + i
+
+        token_emb = model.core.token_emb(current_token_idx)
+        cos, sin = model.rope(token_emb, seq_len=1, offset=position)
+        rotated_emb = apply_rotary_pos_emb(token_emb.unsqueeze(1), cos, sin).squeeze(1)
+
+        v_out, x_state, rho_state = model.core.step(rotated_emb, x_state, rho_state)
+        logits = model.head(v_out)
+
+        probs = F.softmax(logits / args.temperature, dim=-1)
+        next_token_idx = torch.multinomial(probs, num_samples=1)
+
+        next_char = itos.get(next_token_idx.item(), '?')
+        generated_text += next_char
+        print(next_char, end='', flush=True)
+
+        current_token_idx = next_token_idx.squeeze(0)
+
+    print("\n\n--- Generation complete ---")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate text with a trained BDH-GPU model.")
+    parser.add_argument("--prompt", type=str, default="Hello, ", help="Starting prompt.")
+    parser.add_argument("--length", type=int, default=500, help="Number of characters to generate.")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use.")
+
+    args = parser.parse_args()
+    generate(args)
+
+[File Ends] bartman/generate.py
+
+[File Begins] bartman/train.py
+# train.py (VERSION 15 - Final & Lauffähig)
+# Nutzt die korrekte RoPE Implementierung und eine saubere Architektur.
+
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import optim
+import bdh_paper
+from bdh_paper import BDH_GPU, RotaryEmbedding
+import random
+import sys
+import os
+
+def load_text_and_vocab(path: str):
+    with open(path, "r", encoding="utf-8") as f: text = f.read()
+    vocab = sorted(list(set(text)))
+    stoi = {ch: i for i, ch in enumerate(vocab)}
+    itos = {i: ch for ch, i in stoi.items()}
+    data = torch.tensor([stoi[ch] for ch in text], dtype=torch.long)
+    return data, stoi, itos, text
+
+def get_batch(data, block_size, batch_size, device, is_sequential=False, step=0):
+    if is_sequential:
+        total_len = len(data)
+        if total_len <= block_size: return None, None
+        num_sequences_per_batch = (total_len - 1) // block_size // batch_size
+        if num_sequences_per_batch == 0: return None, None
+        start_index = step * block_size
+        if start_index >= num_sequences_per_batch * block_size: return None, None
+        ix_starts = [start_index + i * (num_sequences_per_batch * block_size) for i in range(batch_size)]
+        if any(i + block_size + 1 > len(data) for i in ix_starts): return None, None
+        x = torch.stack([data[i:i+block_size] for i in ix_starts])
+        y = torch.stack([data[i+1:i+1+block_size] for i in ix_starts])
+    else:
+        if len(data) <= block_size: return None, None
+        ix = torch.randint(len(data) - block_size - 1, (batch_size,))
+        x = torch.stack([data[i:i+block_size] for i in ix])
+        y = torch.stack([data[i+1:i+1+block_size] for i in ix])
+    return x.to(device), y.to(device)
+
+@torch.no_grad()
+def debug_model_state(model, epoch):
+    print("\n" + "="*50 + f"\nDEBUGGING MODEL STATE AFTER EPOCH {epoch}\n" + "="*50)
+    tensors = {"PARAM_E": model.core.E, "PARAM_Dx": model.core.Dx, "PARAM_Dy": model.core.Dy,"PARAM_Head": model.head.weight, "STATE_rho": model.core.rho_state, "STATE_x": model.core.x_state}
+    for name, t in tensors.items():
+        if t is None: continue
+        if torch.isnan(t).any() or torch.isinf(t).any(): print(f"!!! WARNING: {name} contains NaN/Inf!")
+        norm, mean, std, min_val, max_val = t.norm().item(), t.mean().item(), t.std().item(), t.min().item(), t.max().item()
+        print(f"  {name:<12} | Shape: {str(list(t.shape)):<20} | Norm: {norm:<8.4f} | Mean: {mean:<8.4f} | Std: {std:<8.4f} | Min: {min_val:<8.4f} | Max: {max_val:<8.4f}")
+    print("="*50 + "\n")
+
+class BDHLanguageModel(nn.Module):
+    def __init__(self, core: BDH_GPU):
+        super().__init__()
+        self.core = core
+        self.head = nn.Linear(core.d, core.V, bias=False)
+        self.rope = RotaryEmbedding(core.d)
+
+    def forward(self, idx: torch.Tensor, x_state=None, rho_state=None):
+        seq_len = idx.shape[1]
+        token_embeddings = self.core.token_emb(idx)
+        rotated_embeddings = self.rope(token_embeddings, seq_len=seq_len)
+        v_out = self.core(rotated_embeddings, x_state, rho_state)
+        return self.head(v_out), self.core.x_state, self.core.rho_state
+
+@torch.no_grad()
+def evaluate_robust_memorization(model: BDHLanguageModel, full_text: str, stoi: dict, itos: dict, device: torch.device):
+    print("\n" + "-"*60)
+    print(" RUNNING ROBUST MEMORIZATION EVALUATION")
+    print("-"*60)
+
+    model.eval()
+
+    NUM_PROBES = 10
+    PROBE_LEN = 128
+    PROMPT_RATIO = 0.25
+
+    total_correct = 0
+    total_predictions = 0
+    probe_accuracies = []
+
+    for i in range(NUM_PROBES):
+        start_index = int((i / NUM_PROBES) * (len(full_text) - PROBE_LEN - 1))
+        eval_text = full_text[start_index : start_index + PROBE_LEN]
+
+        prompt_len = int(PROBE_LEN * PROMPT_RATIO)
+        prompt = eval_text[:prompt_len]
+        ground_truth = eval_text[prompt_len:]
+
+        prompt_ids = torch.tensor([[stoi.get(c, 0) for c in prompt]], dtype=torch.long, device=device)
+
+        model.core.reset_state(1, device)
+        x_state, rho_state = model.core.x_state, model.core.rho_state
+
+        if prompt_ids.shape[1] > 1:
+            _, x_state, rho_state = model(prompt_ids[:, :-1], x_state, rho_state)
+
+        current_token_idx = prompt_ids[:, -1]
+
+        probe_correct = 0
+        for t, expected_char in enumerate(ground_truth):
+            position = prompt_len + t
+
+            token_emb = model.core.token_emb(current_token_idx)
+            rotated_emb = model.rope(token_emb.unsqueeze(1), seq_len=1, offset=position)
+
+            v_out, x_state, rho_state = model.core.step(rotated_emb.squeeze(1), x_state, rho_state)
+
+            logits = model.head(v_out)
+            next_token_idx = torch.argmax(logits, dim=-1)
+            predicted_char = itos.get(next_token_idx.item())
+
+            if predicted_char == expected_char:
+                probe_correct += 1
+            current_token_idx = next_token_idx
+
+        total_correct += probe_correct
+        total_predictions += len(ground_truth)
+        probe_accuracy = probe_correct / len(ground_truth) if len(ground_truth) > 0 else 0
+        probe_accuracies.append(probe_accuracy)
+
+        sys.stdout.write(f"\r  Running probes... {i+1}/{NUM_PROBES}")
+        sys.stdout.flush()
+
+    print()
+
+    formatted_accuracies = [f"{acc:.2%}" for acc in probe_accuracies]
+    print(f"  Individual Probe Accuracies: [{', '.join(formatted_accuracies)}]")
+
+    final_accuracy = total_correct / total_predictions if total_predictions > 0 else 0
+
+    print(f"\nAggregierte Memorisierungs-Genauigkeit: {total_correct}/{total_predictions} ({final_accuracy:.2%})")
+    print("-"*60 + "\n")
+
+    model.train()
+    return final_accuracy
+
+def train(args):
+    global DIM_DEBUG
+    if args.dim_debug:
+        bdh_paper.DIM_DEBUG = True
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if args.seed is not None:
+        print(f"Setting random seed to {args.seed}")
+        random.seed(args.seed)
+        os.environ['PYTHONHASHSEED'] = str(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+    data, stoi, itos, full_text = load_text_and_vocab(args.file)
+    vocab_size = len(stoi)
+    print(f"Loaded text with {len(data)} characters, vocabulary size {vocab_size}.")
+
+    core_model = BDH_GPU(n=args.n, d=args.d, V=vocab_size, u_decay=args.u_decay, x_decay=args.x_decay)
+    model = BDHLanguageModel(core_model).to(device)
+    print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M trainable parameters.")
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    print("Starting training...")
+
+    is_small_dataset = len(data) < args.block_size * args.batch_size * 5
+    if is_small_dataset:
+        print("Small dataset detected. Using random sampling for training.")
+        steps_per_epoch = 100
+    else:
+        print("Large dataset detected. Using sequential batching.")
+        steps_per_epoch = (len(data) - 1) // (args.block_size * args.batch_size)
+
+    x_state, rho_state = None, None
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        print(f"\n--- Starting Epoch {epoch}/{args.epochs} ---")
+        if not is_small_dataset:
+            model.core.reset_state(args.batch_size, device)
+            x_state, rho_state = model.core.x_state, model.core.rho_state
+
+        for step in range(steps_per_epoch):
+            if is_small_dataset:
+                 model.core.reset_state(args.batch_size, device)
+                 x_state, rho_state = model.core.x_state, model.core.rho_state
+
+            x, y = get_batch(data, args.block_size, args.batch_size, device, is_sequential=not is_small_dataset, step=step)
+            if x is None: break
+
+            logits, x_state, rho_state = model(x, x_state, rho_state)
+            loss = loss_fn(logits.view(-1, logits.shape[-1]), y.view(-1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            if step % args.log_interval == 0 or (step == steps_per_epoch - 1):
+                print(f"Epoch {epoch} | Step [{step+1}/{steps_per_epoch}] | Loss: {loss.item():.4f}")
+
+        if args.debug:
+            debug_model_state(model, epoch, x_state, rho_state)
+
+        if args.evaluate:
+            evaluate_robust_memorization(model, full_text, stoi, itos, device)
+
+    print("\nTraining complete. Saving checkpoint to bdh_model_checkpoint.pt")
+
+    state_dict = model.state_dict()
+    config = {'n': args.n, 'd': args.d, 'V': vocab_size, 'u_decay': args.u_decay, 'x_decay': args.x_decay}
+    checkpoint = {'model_state_dict': state_dict, 'stoi': stoi, 'itos': itos, 'config': config}
+    torch.save(checkpoint, "bdh_model_checkpoint.pt")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train a BDH-GPU language model with optional evaluation.")
+    parser.add_argument("--file", type=str, required=True, help="Path to the training text file.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use.")
+    parser.add_argument("--epochs", type=int, default=3, help="Total training epochs.")
+    parser.add_argument("--log_interval", type=int, default=100, help="Steps between logs.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--block_size", type=int, default=128, help="Sequence length for TBPTT.")
+    parser.add_argument("--n", type=int, default=2048, help="Neuronal dimension.")
+    parser.add_argument("--d", type=int, default=128, help="Latent dimension.")
+    parser.add_argument("--u_decay", type=float, default=0.97, help="Decay for rho-state.")
+    parser.add_argument("--x_decay", type=float, default=0.97, help="Decay for x-state.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--debug", action='store_true', help="Enable detailed logging after each epoch.")
+    parser.add_argument("--evaluate", action='store_true', help="Run robust memorization evaluation after each epoch.")
+    parser.add_argument("--dim-debug", action='store_true', help="Print tensor dimensions inside RoPE for debugging.")
+
+    args = parser.parse_args()
+    train(args)
+
+[File Ends] bartman/train.py
+
+[File Begins] takzen/bdh.py
+# bdh.py
+# Contains the full implementation of the BDH model architecture.
+# Based on the reference code provided by the authors.
+# Copyright 2025 Pathway Technology, Inc.
+
+import dataclasses
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+@dataclasses.dataclass
+class BDHConfig:
+    """
+    Configuration class for the BDH model.
+    dataclass provides a clean way to define parameters.
+    """
+    n_layer: int = 6
+    n_embd: int = 256
+    dropout: float = 0.1
+    n_head: int = 4
+    mlp_internal_dim_multiplier: int = 128
+    vocab_size: int = 256
+
+
+def get_freqs(n, theta, dtype):
+    """
+    Calculates frequencies for Rotary Positional Encoding.
+    """
+    def quantize(t, q=2):
+        return (t / q).floor() * q
+
+    return (
+        1.0
+        / (theta ** (quantize(torch.arange(0, n, 1, dtype=dtype)) / n))
+        / (2 * math.pi)
+    )
+
+
+class Attention(torch.nn.Module):
+    """
+    The core Attention module, implementing Linear Attention with RoPE.
+    """
+    def __init__(self, config: BDHConfig):
+        super().__init__()
+        self.config = config
+        nh = config.n_head
+        D = config.n_embd
+        
+        # The size of the conceptual space per head
+        N = config.mlp_internal_dim_multiplier * D // nh
+        
+        # Frequencies are stored in a buffer, as they are not trainable parameters
+        self.freqs = torch.nn.Buffer(
+            get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N)
+        )
+
+    @staticmethod
+    def phases_cos_sin(phases):
+        """Helper function to calculate cos and sin from phases."""
+        phases = (phases % 1) * (2 * math.pi)
+        phases_cos = torch.cos(phases)
+        phases_sin = torch.sin(phases)
+        return phases_cos, phases_sin
+
+    @staticmethod
+    def rope(phases, v):
+        """Applies Rotary Positional Encoding to a vector."""
+        # Create a rotated version of the vector v
+        v_rot = torch.stack((-v[..., 1::2], v[..., ::2]), dim=-1).view(*v.size())
+        phases_cos, phases_sin = Attention.phases_cos_sin(phases)
+        
+        # Apply the rotation
+        return (v * phases_cos).to(v.dtype) + (v_rot * phases_sin).to(v.dtype)
+
+    def forward(self, Q, K, V):
+        assert self.freqs.dtype == torch.float32
+        assert K is Q # This attention mechanism assumes Q and K are the same
+        
+        _, _, T, _ = Q.size() # Get the sequence length T
+
+        # Calculate phases for RoPE based on token position
+        r_phases = (
+            torch.arange(
+                0,
+                T,
+                device=self.freqs.device,
+                dtype=self.freqs.dtype,
+            ).view(1, 1, -1, 1)
+        ) * self.freqs
+        
+        # Apply RoPE to Queries and Keys
+        QR = self.rope(r_phases, Q)
+        KR = QR # Since Q and K are the same
+
+        # --- THIS IS THE LINEAR ATTENTION ---
+        # Note the absence of softmax. This is the core of the efficient implementation.
+        # .tril() applies the causal mask.
+        scores = (QR @ KR.mT).tril(diagonal=-1)
+        
+        return scores @ V
+
+
+class BDH(nn.Module):
+    """
+    The full BDH model.
+    """
+    def __init__(self, config: BDHConfig):
+        super().__init__()
+        assert config.vocab_size is not None
+        self.config = config
+        nh = config.n_head
+        D = config.n_embd
+        
+        # The size of the conceptual space per head
+        N = D * config.mlp_internal_dim_multiplier // nh
+        
+        # --- Parameter Definitions ---
+        self.decoder = nn.Parameter(torch.zeros((nh * N, D)).normal_(std=0.02))
+        self.encoder = nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02))
+        self.encoder_v = nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02))
+        
+        # --- Module Definitions ---
+        self.attn = Attention(config)
+        self.ln = nn.LayerNorm(D, elementwise_affine=False, bias=False)
+        self.embed = nn.Embedding(config.vocab_size, D)
+        self.drop = nn.Dropout(config.dropout)
+        
+        # --- Language Model Head ---
+        self.lm_head = nn.Parameter(
+            torch.zeros((D, config.vocab_size)).normal_(std=0.02)
+        )
+        # The original code has a "gate" which we can ignore for now for simplicity
+        # self.lm_gate = nn.Parameter(torch.zeros((D, 1)).normal_(std=0.02))
+
+        # Apply custom weight initialization
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Custom weight initialization."""
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        C = self.config
+        B, T = idx.size()
+        D = C.n_embd
+        nh = C.n_head
+        N = D * C.mlp_internal_dim_multiplier // nh
+
+        # 1. Embedding
+        x = self.embed(idx).unsqueeze(1) # (B, 1, T, D)
+        x = self.ln(x)
+
+        # 2. Processing through layers
+        for _ in range(C.n_layer):
+            # --- This is one block of the BDH architecture ---
+            x_res = x # Store for residual connection
+            
+            # Project to conceptual space
+            x_latent = x @ self.encoder
+            x_sparse = F.relu(x_latent)  # (B, nh, T, N)
+
+            # Attention in conceptual space
+            yKV = self.attn(
+                Q=x_sparse,
+                K=x_sparse,
+                V=x, # Note: Values are the original, dense vectors
+            )
+            yKV = self.ln(yKV)
+
+            # Modulation
+            y_latent = yKV @ self.encoder_v
+            y_sparse = F.relu(y_latent)
+            xy_sparse = x_sparse * y_sparse
+            xy_sparse = self.drop(xy_sparse)
+
+            # Project back to working space
+            yMLP = (
+                xy_sparse.transpose(1, 2).reshape(B, 1, T, N * nh) @ self.decoder
+            )
+            y = self.ln(yMLP)
+            
+            # Apply residual connection
+            x = self.ln(x_res + y)
+
+        # 3. Final readout (Language Model Head)
+        logits = x.view(B, T, D) @ self.lm_head
+        
+        # 4. Calculate loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Generate new tokens autoregressively.
+        """
+        self.eval()
+        for _ in range(max_new_tokens):
+            # We don't need to crop context, the model handles long sequences
+            logits, _ = self(idx)
+            
+            # Focus on the last token's logits
+            logits = logits[:, -1, :] / temperature
+            
+            # Optional: Top-k sampling
+            if top_k is not None:
+                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < values[:, [-1]]] = float("-inf")
+                
+            # Get probabilities and sample the next token
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append the new token
+            idx = torch.cat((idx, idx_next), dim=1)
+            
+        self.train()
+        return idx
+[File Ends] takzen/bdh.py
+
+[File Begins] takzen/train.py
+# train.py
+# Final comparative version based on our working script.
+# Can train either BDH or GPT models.
+
+import os
+from contextlib import nullcontext
+import torch
+import numpy as np
+import requests
+import argparse # For command-line arguments
+
+# Import both model architectures
+import bdh
+import gpt
+
+# --- Configuration Section ---
+# Default parameters, can be overridden if needed
+BLOCK_SIZE = 512
+BATCH_SIZE = 8
+MAX_ITERS = 3000
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 0.1
+LOG_FREQ = 100
+CHECKPOINT_FREQ = 1000
+
+# Compilation settings from your version
+USE_COMPILE = True
+COMPILE_MODE = "default" # This isn't used, but we keep it for consistency
+
+# --- Device and Dtype Setup (Your version) ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = ("bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16")
+ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
+ctx = (torch.amp.autocast(device_type=device.type, dtype=ptdtype) if "cuda" in str(device) else nullcontext())
+scaler = torch.amp.GradScaler(enabled=(dtype == "float16"))
+
+# --- Performance Optimizations (Your version) ---
+torch.manual_seed(1337)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+print(f"Using device: {device} with dtype: {dtype}")
+
+# --- Data Loading Section (Your version) ---
+input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
+def fetch_data():
+    if not os.path.exists(input_file_path):
+        print("Downloading Tiny Shakespeare dataset...")
+        data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        with open(input_file_path, "w", encoding="utf-8") as f:
+            f.write(requests.get(data_url).text)
+        print("Dataset downloaded.")
+def get_batch(split):
+    data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
+    split_idx = int(0.9 * len(data))
+    data = data[:split_idx] if split == "train" else data[split_idx:]
+    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    x = torch.stack([torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64)) for i in ix])
+    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+    return x, y
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # --- NEW: Argument Parser ---
+    parser = argparse.ArgumentParser(description="Train either a BDH or a GPT model.")
+    parser.add_argument('--model_type', type=str, default='bdh', choices=['bdh', 'gpt'],
+                        help='The type of model to train (bdh or gpt).')
+    args = parser.parse_args()
+    print(f"\nSelected model type for training: {args.model_type.upper()}")
+    
+    fetch_data()
+
+    # --- NEW: Model selection logic ---
+    if args.model_type == 'bdh':
+        model_config = bdh.BDHConfig() # Default config from bdh.py
+        model = bdh.BDH(model_config).to(device)
+        MODEL_CHECKPOINT_PATH = "bdh_shakespeare_checkpoint.pth"
+        FINAL_MODEL_PATH = "bdh_shakespeare_final.pth"
+    elif args.model_type == 'gpt':
+        # GPT config to match BDH's ~25M parameters
+        model_config = gpt.GPTConfig(n_layer=8, n_head=8, n_embd=512, block_size=BLOCK_SIZE)
+        model = gpt.GPT(model_config).to(device)
+        MODEL_CHECKPOINT_PATH = "gpt_shakespeare_checkpoint.pth"
+        FINAL_MODEL_PATH = "gpt_shakespeare_final.pth"
+
+    print(f"Model initialized with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters.")
+
+    # Your compilation block, unchanged
+    if USE_COMPILE:
+        print(f"Compiling the model...")
+        try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            model = torch.compile(model, backend="aot_eager")
+            print("Model compiled successfully with 'aot_eager' backend.")
+        except Exception as e:
+            print(f"Warning: torch.compile failed with error: {e}\nContinuing without compilation...")
+    else:
+        print("Compilation disabled, running in eager mode.")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    # Your training loop, unchanged
+    print(f"\nStarting training for {MAX_ITERS} iterations...")
+    # ... (cała pętla treningowa, checkpointing, generowanie i zapis - bez zmian)
+    loss_acc = 0.0
+    loss_steps = 0
+    for step in range(MAX_ITERS):
+        x, y = get_batch("train")
+        with ctx:
+            _, loss = model(x, y)
+        loss_acc += loss.item()
+        loss_steps += 1
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        if step > 0 and step % LOG_FREQ == 0:
+            avg_loss = loss_acc / loss_steps
+            print(f"Step: {step}/{MAX_ITERS} | loss: {avg_loss:.4f}")
+            loss_acc = 0.0
+            loss_steps = 0
+        if step > 0 and step % CHECKPOINT_FREQ == 0:
+            print(f"\n--- Saving checkpoint at step {step} ---")
+            torch.save(model.state_dict(), MODEL_CHECKPOINT_PATH)
+            print(f"Model checkpoint saved to {MODEL_CHECKPOINT_PATH}")
+            print("-----------------------------------------")
+
+    print("\nTraining finished. Generating a sample...")
+    model.eval()
+    prompt = torch.tensor(bytearray("To be or not to be", "utf-8"), dtype=torch.long, device=device).unsqueeze(0)
+    with torch.no_grad():
+        with ctx:
+            ret = model.generate(prompt, max_new_tokens=200, top_k=5)
+    ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(errors="backslashreplace")
+    print("-" * 50)
+    print(ret_decoded)
+    print("-" * 50)
+
+    print(f"\nSaving final model to {FINAL_MODEL_PATH}...")
+    torch.save(model.state_dict(), FINAL_MODEL_PATH)
+    print("Final model saved successfully.")
+[File Ends] takzen/train.py
+
+
+<-- File Content Ends
+
